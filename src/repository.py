@@ -70,6 +70,11 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS operator_members (
+                    operator TEXT NOT NULL,
+                    actor TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
         finally:
@@ -104,6 +109,60 @@ class Repository:
             "INSERT INTO audit_events(item_id,event_type,actor,role,payload,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
             (item_id, event_type, actor, role, canonical_json(payload), previous, event_hash, event["created_at"]),
         )
+
+    def append_audit_event(self, item_id, event_type, actor, role, payload):
+        """在独立事务中追加一条审计事件（用于业务被拒绝时留痕）。"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self.append_audit(conn, item_id, event_type, actor, role, payload)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def add_operator_member(self, operator, actor):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR REPLACE INTO operator_members(operator,actor,created_at) VALUES(?,?,?)",
+                (operator, actor, now_iso()),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def get_operator_member(self, actor):
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT operator FROM operator_members WHERE actor=?", (actor,)
+            ).fetchone()
+            return row["operator"] if row else None
+        finally:
+            conn.close()
+
+    def list_operator_members(self):
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT operator, actor, created_at FROM operator_members ORDER BY operator, actor"
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
 
     def create_item(self, entity_type, stable_key, initial_status, payload, actor, role):
         conn = self.connect()

@@ -34,6 +34,15 @@ class WorkflowTest(unittest.TestCase):
         item = self.service.act(item["id"], "assess", {"hours_to_tca": 18}, "analyst-1", "analyst", item["version"])
         self.assertEqual(item["status"], "assessed")
         self.assertEqual(item["payload"]["assessment"]["level"], "high")
+        # 联合会签：两家运营方各自表态同意后，协调员才能批准规避
+        self.service.register_operator_member("Org-A", "operator-a", "coord-1", "coordinator")
+        self.service.register_operator_member("Org-B", "operator-b", "coord-1", "coordinator")
+        item = self.service.act(item["id"], "record_opinion", {
+            "operator": "Org-A", "opinion": "approve",
+        }, "operator-a", "operator", item["version"])
+        item = self.service.act(item["id"], "record_opinion", {
+            "operator": "Org-B", "opinion": "approve",
+        }, "operator-b", "operator", item["version"])
         item = self.service.act(item["id"], "approve", {
             "fuel_cost_m_s": 2.5,
             "maneuver_window": "2026-09-28T08:00:00Z/2026-09-28T09:00:00Z",

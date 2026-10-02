@@ -86,6 +86,10 @@ def build_handler(service, static_dir):
                         raise DomainError("action_required", "缺少 action", 400)
                     expected = payload.pop("expected_version", None)
                     return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region))
+                if parts == ["api", "operators", "members"]:
+                    return self._send(201, service.register_operator_member(
+                        payload.get("operator", ""), payload.get("actor", ""), actor, role
+                    ))
                 return self._send(404, {"error": "not_found", "message": "接口不存在"})
             except DomainError as exc:
                 return self._error(exc)

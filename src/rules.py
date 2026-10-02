@@ -17,6 +17,10 @@ ENFORCE_REGION = False
 REGION_SENSITIVE_ACTIONS = set()
 ACTION_REQUIRES_VERSION = {"approve", "execute", "resolve", "cancel"}
 
+OPINION_VALUES = {"approve", "reject", "request_review"}
+BLOCKING_OPINIONS = {"reject", "request_review"}
+BLOCK_LABEL = {"reject": "反对", "request_review": "要求复核"}
+
 
 def assess(payload):
     ratio = float(payload.get("miss_distance_m", 0)) / max(float(payload.get("covariance_m", 1)), 1.0)
@@ -55,6 +59,32 @@ def _require_text(payload, name):
     return value.strip()
 
 
+def _latest_opinions(current):
+    """按意见流水取每家运营方的最新表态；未表态的运营方不在结果中。"""
+    latest = {}
+    for entry in current.get("opinions", []):
+        latest[entry["operator"]] = entry["opinion"]
+    return latest
+
+
+def _tally(current):
+    """联合会签计票：返回 (同意方, 反对方/要求复核方, 未表态方)。"""
+    operators = list(current.get("operating_organizations", []))
+    latest = _latest_opinions(current)
+    approved = []
+    blockers = []
+    pending = []
+    for operator in operators:
+        stance = latest.get(operator)
+        if stance is None:
+            pending.append(operator)
+        elif stance in BLOCKING_OPINIONS:
+            blockers.append((operator, stance))
+        else:
+            approved.append(operator)
+    return approved, blockers, pending
+
+
 def apply_action(item, action, payload, actor, role):
     status = item["status"]
     current = dict(item["payload"])
@@ -86,28 +116,57 @@ def apply_action(item, action, payload, actor, role):
         return status, current, {"revision": revision}
 
     if action == "record_opinion":
-        _need_status(item, {"assessed", "coordinating"})
+        _need_status(item, {"assessed", "coordinating", "executing"})
         opinion = _require_text(payload, "opinion").lower()
-        if opinion not in {"approve", "reject", "request_review"}:
+        if opinion not in OPINION_VALUES:
             raise DomainError("invalid_opinion", "意见必须是 approve、reject 或 request_review")
         operator = _require_text(payload, "operator")
-        entry = {"operator": operator, "opinion": opinion, "reason": payload.get("reason", "")}
+        previous = _latest_opinions(current).get(operator)
+        entry = {"operator": operator, "opinion": opinion, "reason": payload.get("reason", ""), "actor": actor}
         current.setdefault("opinions", []).append(entry)
-        if opinion in {"reject", "request_review"}:
-            current["conflict"] = True
-        return status, current, {"opinion": entry}
+        # 以最新表态为准重新计票，维护 conflict 标志
+        _, blockers, _ = _tally(current)
+        current["conflict"] = bool(blockers)
+        event = {"opinion": entry, "conflict": current["conflict"]}
+        new_status = status
+        # 联合会签：批准做出后，一旦有人改动意见，先前批准连带失效。
+        # 尚未发出指令（coordinating）→ 退回重议；指令已发出（executing）→ 保留原记录。
+        if status == "coordinating" and previous != opinion:
+            current.pop("approved_maneuver", None)
+            new_status = "assessed"
+            event["approval_invalidated"] = True
+            event["invalidated_reason"] = "运营方 %s 改动意见（%s → %s），已批准规避退回重议" % (
+                operator, previous or "未表态", opinion
+            )
+        return new_status, current, event
 
     if action == "approve":
         _need_status(item, {"assessed"})
-        if current.get("conflict"):
-            raise DomainError("unresolved_conflict", "存在未解决的运营方冲突意见", 409)
+        approved, blockers, pending = _tally(current)
+        if blockers:
+            names = "、".join("%s（%s）" % (op, BLOCK_LABEL.get(st, st)) for op, st in blockers)
+            raise DomainError(
+                "unresolved_conflict",
+                "运营方 %s 已反对或要求复核，规避批准退回" % names,
+                409,
+            )
+        if pending:
+            raise DomainError(
+                "opinion_pending",
+                "仍有运营方未表态：%s，不能批准规避" % "、".join(pending),
+                409,
+            )
         fuel = _require_number(payload, "fuel_cost_m_s", 0)
         budget = float(current.get("fuel_budget_m_s", 0))
         if fuel > budget:
             raise DomainError("fuel_budget_exceeded", "规避燃料超过预算", 409)
         window = _require_text(payload, "maneuver_window")
-        current["approved_maneuver"] = {"fuel_cost_m_s": fuel, "maneuver_window": window}
-        return "coordinating", current, {"approved_maneuver": current["approved_maneuver"]}
+        current["approved_maneuver"] = {
+            "fuel_cost_m_s": fuel,
+            "maneuver_window": window,
+            "countersigned_by": approved,
+        }
+        return "coordinating", current, {"approved_maneuver": current["approved_maneuver"], "unanimous": True}
 
     if action == "execute":
         _need_status(item, {"coordinating"})
