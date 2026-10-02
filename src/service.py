@@ -1,6 +1,8 @@
 from . import domain, rules
 from .domain import DomainError
 
+REGISTER_OPERATOR_ROLES = {"coordinator", "analyst"}
+
 
 class Service:
     def __init__(self, repository):
@@ -37,6 +39,69 @@ class Service:
         )
         return result
 
+    def register_operator(self, payload, actor, role):
+        if not actor or not role:
+            raise DomainError("identity_required", "需要用户身份和角色", 401)
+        if role not in REGISTER_OPERATOR_ROLES:
+            raise DomainError("forbidden", "当前角色不能登记运营方用户", 403)
+        operator_user_id = domain.require_text(payload, "operator_user_id")
+        organization = domain.require_text(payload, "organization")
+        return self.repository.register_operator(operator_user_id, organization, actor, role)
+
+    def _authorize_opinion(self, item, payload, actor):
+        """运营方只能代表自己名下物体对应的机构表态。"""
+        operator = payload.get("operator")
+        if not isinstance(operator, str) or not operator.strip():
+            raise DomainError("field_required", "operator 不能为空")
+        operator = operator.strip()
+        mapping = item["payload"].get("object_operators", {})
+        object_names = {item["payload"].get("primary_object_id"), item["payload"].get("secondary_object_id")}
+        owned_objects = [obj for obj in object_names if mapping.get(obj) == operator]
+        if not owned_objects:
+            self.repository.record_denial(
+                item["id"],
+                "operator_overreach",
+                actor,
+                "operator",
+                {"action": "record_opinion", "claimed_operator": operator,
+                 "owned_objects_in_event": []},
+            )
+            raise DomainError(
+                "operator_overreach",
+                "运营方 %s 在该接近事件中名下没有物体，不能代表相关运营方表态" % operator,
+                403,
+            )
+        registered_org = self.repository.get_operator_org(actor)
+        if registered_org is None:
+            self.repository.record_denial(
+                item["id"],
+                "operator_overreach",
+                actor,
+                "operator",
+                {"action": "record_opinion", "claimed_operator": operator,
+                 "registered_organization": None, "owned_objects_in_event": owned_objects},
+            )
+            raise DomainError(
+                "operator_overreach",
+                "用户 %s 未登记为任何运营方，不能提交会签意见" % actor,
+                403,
+            )
+        if registered_org != operator:
+            self.repository.record_denial(
+                item["id"],
+                "operator_overreach",
+                actor,
+                "operator",
+                {"action": "record_opinion", "claimed_operator": operator,
+                 "registered_organization": registered_org, "owned_objects_in_event": owned_objects},
+            )
+            raise DomainError(
+                "operator_overreach",
+                "用户 %s 属于 %s，不能代表 %s 表态" % (actor, registered_org, operator),
+                403,
+            )
+        payload["operator"] = operator
+
     def act(self, item_id, action, payload, actor, role, expected_version=None, region=None):
         if not actor or not role:
             raise DomainError("identity_required", "需要用户身份和角色", 401)
@@ -49,10 +114,16 @@ class Service:
                 raise DomainError("region_mismatch", "不能处理其他区域的记录", 403)
         if action in rules.ACTION_REQUIRES_VERSION and expected_version is None:
             raise DomainError("expected_version_required", "该操作需要 expected_version", 400)
-        new_status, new_payload, event_payload = rules.apply_action(item, action, payload, actor, role)
-        self.repository.apply_action(
-            item_id, action, actor, role, new_status, new_payload, event_payload, expected_version
-        )
+        if action == "record_opinion":
+            self._authorize_opinion(item, payload, actor)
+
+        def mutator(latest_item, submitted_at):
+            action_payload = dict(payload)
+            if action == "record_opinion":
+                action_payload["submitted_at"] = submitted_at
+            return rules.apply_action(latest_item, action, action_payload, actor, role)
+
+        self.repository.apply_action(item_id, action, actor, role, mutator, expected_version)
         return self.get_item(item_id)
 
     def get_item(self, item_id):
@@ -60,6 +131,7 @@ class Service:
         item["sources"] = self.repository.list_sources(item_id)
         item["audit"] = self.repository.audit_trail(item_id)
         item["assessment"] = rules.assess(item["payload"])
+        item["signoff"] = rules.signoff_summary(item["payload"])
         return item
 
     def list_items(self, status=None):

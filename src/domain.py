@@ -75,6 +75,29 @@ def normalize_create(payload):
     operators = payload.get("operating_organizations", [])
     if not isinstance(operators, list) or any(not isinstance(item, str) or not item.strip() for item in operators):
         raise DomainError("invalid_operators", "运营方必须是字符串列表")
+    operators = [item.strip() for item in operators]
+    object_operators = payload.get("object_operators")
+    if object_operators is None:
+        if len(set(operators)) == 1:
+            object_operators = {primary: operators[0], secondary: operators[0]}
+        elif len(operators) == 2:
+            object_operators = {primary: operators[0], secondary: operators[1]}
+        else:
+            raise DomainError(
+                "invalid_object_operators",
+                "涉及两家以上运营方时必须提供 object_operators 物体归属表",
+            )
+    if not isinstance(object_operators, dict) or any(
+        not isinstance(key, str) or not key.strip()
+        or not isinstance(value, str) or not value.strip()
+        for key, value in object_operators.items()
+    ):
+        raise DomainError("invalid_object_operators", "object_operators 必须是 物体ID->运营方 的字符串映射")
+    object_operators = {key.strip(): value.strip() for key, value in object_operators.items()}
+    if set(object_operators.keys()) != {primary, secondary}:
+        raise DomainError("invalid_object_operators", "object_operators 必须且只能声明接近事件的两个物体")
+    if set(object_operators.values()) != set(operators):
+        raise DomainError("invalid_object_operators", "物体归属的运营方与 operating_organizations 名单不一致")
     stable_key = "%s|%s|%s" % tuple(sorted([primary, secondary]) + [tca])
     return {
         "primary_object_id": primary,
@@ -84,9 +107,14 @@ def normalize_create(payload):
         "covariance_m": covariance,
         "fuel_budget_m_s": fuel_budget,
         "track_age_hours": track_age,
-        "operating_organizations": [item.strip() for item in operators],
+        "operating_organizations": operators,
+        "object_operators": object_operators,
         "revisions": [],
         "opinions": [],
+        "countersign": None,
+        "countersign_history": [],
+        "pending_command": None,
+        "returned_commands": [],
         "conflict": False,
         "_stable_key": stable_key,
     }

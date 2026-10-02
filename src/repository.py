@@ -70,6 +70,13 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS operator_registrations (
+                    operator_user_id TEXT PRIMARY KEY,
+                    organization TEXT NOT NULL,
+                    registered_by TEXT NOT NULL,
+                    registered_role TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
         finally:
@@ -207,7 +214,12 @@ class Repository:
         finally:
             conn.close()
 
-    def apply_action(self, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version=None):
+    def apply_action(self, item_id, action, actor, role, mutator, expected_version=None):
+        """在单个 IMMEDIATE 事务内读取最新行 -> 校验版本 -> 计算迁移 -> 落库。
+
+        mutator(latest_item, submitted_at) 返回 (new_status, new_payload, event_payload)。
+        并发提交按拿锁先后串行化，意见序号、提交时间与提交顺序一致。
+        """
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -216,6 +228,9 @@ class Repository:
                 raise NotFoundError("item_not_found", "业务实体不存在")
             if expected_version is not None and int(expected_version) != int(row["version"]):
                 raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
+            latest_item = self._row_to_item(row)
+            submitted_at = now_iso()
+            new_status, new_payload, event_payload = mutator(latest_item, submitted_at)
             version = int(row["version"]) + 1
             conn.execute(
                 "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
@@ -228,6 +243,74 @@ class Repository:
             self.append_audit(conn, item_id, action, actor, role, event_payload)
             conn.execute("COMMIT")
             return self.get_item(item_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def register_operator(self, operator_user_id, organization, actor, role):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT organization FROM operator_registrations WHERE operator_user_id=?",
+                (operator_user_id,),
+            ).fetchone()
+            if existing is not None and existing["organization"] != organization:
+                raise ConflictError(
+                    "operator_already_registered",
+                    "运营方用户 %s 已登记在 %s 名下" % (operator_user_id, existing["organization"]),
+                )
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO operator_registrations(operator_user_id,organization,registered_by,registered_role,created_at) VALUES(?,?,?,?,?)",
+                    (operator_user_id, organization, actor, role, now_iso()),
+                )
+            conn.execute("COMMIT")
+            return {"operator_user_id": operator_user_id, "organization": organization}
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def get_operator_org(self, operator_user_id):
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT organization FROM operator_registrations WHERE operator_user_id=?",
+                (operator_user_id,),
+            ).fetchone()
+            return row["organization"] if row else None
+        finally:
+            conn.close()
+
+    def list_operator_registrations(self):
+        conn = self.connect()
+        try:
+            return [dict(row) for row in conn.execute(
+                "SELECT operator_user_id, organization FROM operator_registrations ORDER BY organization, operator_user_id"
+            ).fetchall()]
+        finally:
+            conn.close()
+
+    def record_denial(self, item_id, reason, actor, role, details):
+        """被拒绝的操作（如越权表态）不改业务状态，只追加一条审计。"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self.append_audit(conn, item_id, "action_denied", actor, role, {
+                "reason": reason,
+                **details,
+            })
+            conn.execute("COMMIT")
         except Exception:
             try:
                 conn.execute("ROLLBACK")

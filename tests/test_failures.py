@@ -39,15 +39,17 @@ class FailureTest(unittest.TestCase):
             self.service.act(item["id"], "assess", {"hours_to_tca": 2}, "x", "operator", item["version"])
         self.assertEqual(context.exception.status, 403)
 
-    def test_version_conflict_and_conflicting_opinion(self):
+    def test_version_conflict_and_blocking_opinion(self):
+        self.service.register_operator({"operator_user_id": "op-a", "organization": "Org-A"}, "c", "coordinator")
         item = self.service.create_item(self.payload, "a", "analyst")
         item = self.service.act(item["id"], "assess", {"hours_to_tca": 2}, "a", "analyst", item["version"])
-        item = self.service.act(item["id"], "record_opinion", {"operator": "Org-A", "opinion": "reject", "reason": "unsafe"}, "operator-1", "operator", item["version"])
+        item = self.service.act(item["id"], "record_opinion", {"operator": "Org-A", "opinion": "reject", "reason": "unsafe"}, "op-a", "operator")
         with self.assertRaises(DomainError) as context:
             self.service.act(item["id"], "approve", {"fuel_cost_m_s": 1, "maneuver_window": "w"}, "c", "coordinator", item["version"])
-        self.assertEqual(context.exception.code, "unresolved_conflict")
+        self.assertEqual(context.exception.code, "signoff_blocked")
+        self.assertIn("Org-A", str(context.exception))
         with self.assertRaises(ConflictError):
-            self.service.act(item["id"], "record_opinion", {"operator": "Org-A", "opinion": "approve"}, "operator-1", "operator", item["version"] - 1)
+            self.service.act(item["id"], "record_opinion", {"operator": "Org-A", "opinion": "approve"}, "op-a", "operator", item["version"] - 1)
 
 
 if __name__ == "__main__":
